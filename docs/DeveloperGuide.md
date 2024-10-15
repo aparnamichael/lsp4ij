@@ -82,6 +82,21 @@ public class MyLanguageServerFactory implements LanguageServerFactory {
 }
 ```
 
+In this sample `MyCustomServerAPI` interface could look like this:
+
+```java
+import org.eclipse.lsp4j.jsonrpc.services.JsonRequest;
+import org.eclipse.lsp4j.services.LanguageServer;
+
+import java.util.concurrent.CompletableFuture;
+
+public interface MyCustomServerAPI  extends LanguageServer {
+
+    @JsonRequest("my/applications")
+    CompletableFuture<List<Application>> getApplications();
+}
+```
+
 If you need to provide client specific features (e.g. commands), you can override the `createLanguageClient` method to
 return your custom LSP client implementation.
 
@@ -509,6 +524,153 @@ Project project = ...
 LanguageServerManager.getInstance(project).stop("myLanguageServerId", options);
 ```
 
+### Get language server
+
+If you need to execute an LSP Command, please read [here](#execute-a-command)
+
+If you need to get your language server and execute something with it, you can write code like this:
+
+```java
+LanguageServerManager.getInstance(project)
+        .getLanguageServer("myLanguageServerId")
+        .thenAccept(languageServerItem -> {
+            if (languageServerItem != null) {
+                // Language server item exists here...
+              
+                // Get the LSP4J LanguageServer
+                org.eclipse.lsp4j.services.LanguageServer ls = languageServerItem.getServer();
+              
+                // Do something with the language server
+                
+            }});
+```
+
+Here `LanguageServerItem#getServer()` is used because we are sure that language server is initialized.
+
+Here a sample which consumes custom services with [MyCustomApi](#languageserverfactory) 
+
+```java
+import org.eclipse.lsp4j.jsonrpc.services.JsonRequest;
+import org.eclipse.lsp4j.services.LanguageServer;
+
+import java.util.concurrent.CompletableFuture;
+
+public interface MyCustomServerAPI  extends LanguageServer {
+
+    @JsonRequest("my/applications")
+    CompletableFuture<List<Application>> getApplications();
+}
+```
+
+to get list of Application:
+
+```java
+CompletableFuture<List<Application>> applications =
+  LanguageServerManager.getInstance(project)
+    .getLanguageServer("myLanguageServerId")
+    .thenApply(languageServerItem -> 
+                    languageServerItem != null ? languageServerItem.getServer() // here getServer is used because we are sure that server is initialized  
+                    : null)
+    .thenCompose(ls -> {
+      if (ls == null) {
+          return CompletableFuture.completedFuture(Collections.emptyList());
+      }
+      MyCustomServerAPI myServer = (MyCustomServerAPI) ls;
+      return myServer.getApplications();}
+    );
+```
+
+If you need to get your language server and store it in a field to keep a connection and reuse it several times, you can:
+
+ * store the result in a languageServerFuture field:
+
+```java
+Project project = ...
+CompletableFuture<@Nullable LanguageServerItem> languageServerFuture = 
+        LanguageServerManager.getInstance(project)
+            .getLanguageServer("myLanguageServerId");
+```
+ * consume it several times:
+
+```java
+CompletableFuture<List<Application>> applications = 
+     languageServerFuture
+     .thenCompose(languageServerItem -> {
+       if (languageServerItem != null) {
+         return CompletableFuture.completedFuture(null);
+       }
+       return languageServerItem.getInitializedServer(); // here getInitializedServer is used because language server could be stopped and must be restarted
+     })
+    .thenCompose(ls -> {
+      if (ls == null) {
+          return CompletableFuture.completedFuture(Collections.emptyList());
+      }
+      MyCustomServerAPI myServer = (MyCustomServerAPI) ls;
+      return myServer.getApplications();}
+    );
+```
+
+## Keep a Language Server alive with a Lease
+
+If you need a reference to your language server and need to execute operations with it, 
+for an extended period of time, you can use `LanguageServerItem.keepAlive()` method to create
+a `Lease` on the item. The lease represents a request for lsp4ij not to terminate the language 
+server until the `Lease` is disposed.
+
+```java
+Project project = ...
+CompletableFuture<Lease<LanguageServerItem>> serverLease = 
+        LanguageServerManager.getInstance(project).getLanguageServer("myLanguageServerId")
+        .thenApply(item -> item.keepAlive());
+```
+
+As long as the lease has not been disposed this will request lsp4ij not arbitrarily terminate the language
+server under 'normal circumstances'. This means that the server will not be terminated for example when
+there are no more open editors.
+
+To get access to your language server from the lease call the `get()` method on the lease.
+This will return a LanuageServerItem that is guaranteed to have an 'active' server at that time.
+
+```java
+import com.intellij.openapi.util.Disposer;
+...
+
+serverLease.thenAccept(lease -> {
+    try {
+       while (...we need to do suff...) {
+          // Fetch list of 'applications' using some custom protocol on 'MyLanguageServer'
+          List<Application> applications = ((MyLanguageServer)lease.get().getServer()).getApplications();   
+          ... do something with the result...
+       }
+    } catch (ServerWasStoppedException e) {   
+        // handle the case where the server was unexpectedly terminated
+        ...
+    } finally {
+       // Release the lease when the server is no longer needed
+       Disposer.dispose(lease);
+    }
+});
+```
+
+Note that it is still possible under some circumstance that the server might get terminated despite having 
+active leases: 
+
+  - the server process could crash unexpectedly. 
+  - a user could stop the language server from lsp4ij UI (but see [LSP Client Features API](./LSPApi.md#lsp-client-features)
+    for a way to disable this user ability by overriding `canStopServerByUser()`)
+  - when the IDE shuts down all language servers will be terminated regardles of active leases.
+
+You should be prepared to handle these kinds of situations in a graceful manner. You can detect whether
+this has happened by handling `ServerWasStoppedException` thrown from `Lease.get()`.
+
+Once you are done using the server and no longer need it to remain alive, you 
+should `dispose` the lease. This tells lsp4ij that you are not using it anymore
+and it is okay to stop the server (presuming there is nothing else still using it, be 
+it another active `Lease` or any open editors).
+
+For more information on the correct way to `dispose` a disposable, see the 
+JavaDoc on `com.intellij.openapi.Disposable` and [here](https://plugins.jetbrains.com/docs/intellij/disposers.html#the-disposer-singleton).
+
 ## LSP commands
 
 ### LSPCommandAction
@@ -540,6 +702,21 @@ This command is used for instance with the [TypeScript Language Server](./user-d
 to open `references/implementations` in a popup when  clicking on a `Codelens` :
 
 ![editor.action.showReferences](./images/commands/ShowReferencesAction.png)
+
+### Execute a command
+
+If you need to `execute an LSP org.eclipse.lsp4j.Command` of your language server in a `View` for example, you can use `CommandExecutor` like this:
+
+```java
+Command command = new Command("My command", "command.from.your.ls");
+LSPCommandContext commandContext = new LSPCommandContext(command, project);
+commandContext.setPreferredLanguageServerId("myLanguageServerId");
+CommandExecutor.executeCommand(commandContext)
+        .response()
+        .thenAccept(r -> {
+        // Do something with the workspace/executeCommand Object response
+        });
+```
 
 # Workspace Configuration
 
@@ -585,3 +762,7 @@ but you can use your own provider with the `semanticTokensColorsProvider` extens
 
 </extensions>
 ```
+
+# Customize LSP features
+
+If you need to customize LSP (completion, diagnostics, etc) features please read [LSP API](./LSPApi.md). 

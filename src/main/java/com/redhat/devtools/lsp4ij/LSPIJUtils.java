@@ -321,23 +321,6 @@ public class LSPIJUtils {
         return LanguageUtil.getLanguageForPsi(project, file);
     }
 
-    private static <T extends TextDocumentPositionParams> T toTextDocumentPositionParamsCommon(T param, int offset, Document document) {
-        Position start = toPosition(offset, document);
-        param.setPosition(start);
-        TextDocumentIdentifier id = new TextDocumentIdentifier();
-        URI uri = toUri(document);
-        if (uri != null) {
-            id.setUri(uri.toASCIIString());
-        }
-        param.setTextDocument(id);
-        return param;
-    }
-
-    public static HoverParams toHoverParams(int offset, Document document) {
-        return toTextDocumentPositionParamsCommon(new HoverParams(), offset, document);
-    }
-
-
     /**
      * Returns the Uri of the virtual file corresponding to the specified document.
      *
@@ -1138,11 +1121,11 @@ public class LSPIJUtils {
     }
 
     /**
-     * Apply text edits by using the given document without updating and returns the result of the apply text edits.
+     * Apply text edits by using the given document without updating and returns the response of the apply text edits.
      *
      * @param document the document used to apply text edits without updating it.
      * @param edits    the text edit list to apply to the given document.
-     * @return the result of the apply text edits.
+     * @return the response of the apply text edits.
      */
     public static String applyEdits(@NotNull Document document,
                                     @NotNull List<? extends TextEdit> edits) {

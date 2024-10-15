@@ -27,20 +27,17 @@ import com.redhat.devtools.lsp4ij.LanguageServerBundle;
 import com.redhat.devtools.lsp4ij.LanguageServerItem;
 import com.redhat.devtools.lsp4ij.commands.CommandExecutor;
 import com.redhat.devtools.lsp4ij.commands.LSPCommandContext;
-import com.redhat.devtools.lsp4ij.internal.StringUtils;
 import org.eclipse.lsp4j.CodeAction;
-import org.eclipse.lsp4j.CodeActionKind;
 import org.eclipse.lsp4j.Command;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-import static com.redhat.devtools.lsp4ij.LanguageServerItem.isCodeActionResolveSupported;
-
 /**
  * The lazy IJ Quick fix / Intention.
  */
 public class LSPLazyCodeActionIntentionAction implements IntentionAction {
+
 
     private LSPLazyCodeActionProvider lazyCodeActions;
 
@@ -85,10 +82,9 @@ public class LSPLazyCodeActionIntentionAction implements IntentionAction {
         var languageServer = getLanguageServer();
         if (codeAction != null) {
             if (codeAction.getEdit() == null && codeAction.getCommand() == null
-                    && isCodeActionResolveSupported(languageServer.getServerCapabilities())) {
+                    && languageServer.getClientFeatures().getCodeActionFeature().isResolveCodeActionSupported(file)) {
                 // Unresolved code action "edit" property. Resolve it.
                 languageServer
-                        .getServerWrapper()
                         .getInitializedServer()
                         .thenApply(ls ->
                                 ls.getTextDocumentService().resolveCodeAction(codeAction)
@@ -148,46 +144,29 @@ public class LSPLazyCodeActionIntentionAction implements IntentionAction {
             // The LSP code action has been already loaded.
             return;
         }
-        // Try to get the LSP code action from the given indes
+        // Try to get the LSP code action from the given index
         this.action = lazyCodeActions.getCodeActionAt(index);
         if (isValidCodeAction()) {
+            var codeActionFeature = getLanguageServer().getClientFeatures().getCodeActionFeature();
             var action = this.action.getLeft().codeAction();
             if (action.isRight()) {
                 codeAction = action.getRight();
-                title = action.getRight().getTitle();
-                familyName = getFamilyName(codeAction);
+                title = codeActionFeature.getText(codeAction);
+                if (title != null) {
+                    familyName = codeActionFeature.getFamilyName(codeAction);
+                }
             } else if (action.isLeft()) {
                 command = action.getLeft();
-                title = command.getTitle();
-                familyName = "LSP Command";
+                title = codeActionFeature.getText(command);
+                if (title != null) {
+                    familyName = codeActionFeature.getFamilyName(command);
+                }
+            }
+            if (title == null) {
+                // The LSP code action feature returns null, ignore the code action
+                this.action = Either.forRight(Boolean.FALSE);
             }
         }
-    }
-
-    @NotNull
-    private static String getFamilyName(@NotNull CodeAction codeAction) {
-        String kind = codeAction.getKind();
-        if (StringUtils.isNotBlank(kind)) {
-            switch (kind) {
-                case CodeActionKind.QuickFix:
-                    return LanguageServerBundle.message("lsp.intention.code.action.kind.quickfix");
-                case CodeActionKind.Refactor:
-                    return LanguageServerBundle.message("lsp.intention.code.action.kind.refactor");
-                case CodeActionKind.RefactorExtract:
-                    return LanguageServerBundle.message("lsp.intention.code.action.kind.refactor.extract");
-                case CodeActionKind.RefactorInline:
-                    return LanguageServerBundle.message("lsp.intention.code.action.kind.refactor.inline");
-                case CodeActionKind.RefactorRewrite:
-                    return LanguageServerBundle.message("lsp.intention.code.action.kind.refactor.rewrite");
-                case CodeActionKind.Source:
-                    return LanguageServerBundle.message("lsp.intention.code.action.kind.source");
-                case CodeActionKind.SourceFixAll:
-                    return LanguageServerBundle.message("lsp.intention.code.action.kind.source.fixAll");
-                case CodeActionKind.SourceOrganizeImports:
-                    return LanguageServerBundle.message("lsp.intention.code.action.kind.source.organizeImports");
-            }
-        }
-        return LanguageServerBundle.message("lsp.intention.code.action.kind.empty");
     }
 
     private boolean isValidCodeAction() {

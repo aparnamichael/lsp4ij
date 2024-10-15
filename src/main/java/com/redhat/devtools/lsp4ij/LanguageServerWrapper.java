@@ -12,12 +12,10 @@ package com.redhat.devtools.lsp4ij;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import com.google.gson.JsonObject;
-import com.intellij.lang.Language;
 import com.intellij.openapi.Disposable;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.editor.Document;
 import com.intellij.openapi.fileEditor.FileEditorManagerListener;
-import com.intellij.openapi.fileTypes.FileType;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.util.Disposer;
 import com.intellij.openapi.vfs.VirtualFile;
@@ -26,11 +24,13 @@ import com.intellij.openapi.vfs.impl.BulkVirtualFileListenerAdapter;
 import com.intellij.psi.PsiFile;
 import com.intellij.util.messages.MessageBusConnection;
 import com.redhat.devtools.lsp4ij.client.LanguageClientImpl;
+import com.redhat.devtools.lsp4ij.client.features.LSPClientFeatures;
 import com.redhat.devtools.lsp4ij.features.files.operations.FileOperationsManager;
 import com.redhat.devtools.lsp4ij.internal.ClientCapabilitiesFactory;
 import com.redhat.devtools.lsp4ij.lifecycle.LanguageServerLifecycleManager;
 import com.redhat.devtools.lsp4ij.lifecycle.NullLanguageServerLifecycleManager;
 import com.redhat.devtools.lsp4ij.server.*;
+import com.redhat.devtools.lsp4ij.server.capabilities.TextDocumentServerCapabilityRegistry;
 import com.redhat.devtools.lsp4ij.server.definition.LanguageServerDefinition;
 import org.eclipse.lsp4j.*;
 import org.eclipse.lsp4j.jsonrpc.Launcher;
@@ -47,6 +47,7 @@ import java.net.URI;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.UnaryOperator;
 
@@ -107,6 +108,9 @@ public class LanguageServerWrapper implements Disposable {
     private final LSPFileListener fileListener = new LSPFileListener(this);
 
     private FileOperationsManager fileOperationsManager;
+
+    private LSPClientFeatures clientFeatures;
+    private final AtomicInteger keepAliveCounter = new AtomicInteger();
 
     /* Backwards compatible constructor */
     public LanguageServerWrapper(@NotNull Project project, @NotNull LanguageServerDefinition serverDefinition) {
@@ -225,9 +229,7 @@ public class LanguageServerWrapper implements Disposable {
                         initParams.setInitializationOptions(provider.getInitializationOptions(rootURI));
 
                         // Add error log
-                        provider.addLogErrorHandler(error -> {
-                            ServerMessageHandler.logMessage(this, new MessageParams(MessageType.Error, error));
-                        });
+                        provider.addLogErrorHandler(error -> ServerMessageHandler.logMessage(this.getServerDefinition(), new MessageParams(MessageType.Error, error), getProject()));
 
                         // Starting process...
                         updateStatus(ServerStatus.starting);
@@ -309,6 +311,7 @@ public class LanguageServerWrapper implements Disposable {
 
                         fileOperationsManager = new FileOperationsManager(this);
                         fileOperationsManager.setServerCapabilities(serverCapabilities);
+                        getClientFeatures().setServerCapabilities(serverCapabilities);
 
                         updateStatus(ServerStatus.started);
                         getLanguageServerLifecycleManager().onStatusChanged(this);
@@ -408,6 +411,9 @@ public class LanguageServerWrapper implements Disposable {
         this.disposed = true;
         stop();
         stopDispatcher();
+        if (clientFeatures != null) {
+            clientFeatures.dispose();
+        }
     }
 
     public boolean isDisposed() {
@@ -629,7 +635,7 @@ public class LanguageServerWrapper implements Disposable {
             return CompletableFuture.completedFuture(null);
         }
 
-        VirtualFile fileToConnect = optionalFile;
+        final @NotNull VirtualFile fileToConnect = optionalFile;
         return initializeFuture.thenComposeAsync(theVoid -> {
             // Here, the "initialize" future is initialized
 
@@ -650,7 +656,7 @@ public class LanguageServerWrapper implements Disposable {
                     return ls2;
                 }
 
-                DocumentContentSynchronizer synchronizer = createDocumentContentSynchronizer(fileUri, document);
+                DocumentContentSynchronizer synchronizer = createDocumentContentSynchronizer(fileUri, fileToConnect, document);
                 document.addDocumentListener(synchronizer);
                 LSPVirtualFileData data = new LSPVirtualFileData(new LanguageServerItem(languageServer, this), fileToConnect, synchronizer);
                 LanguageServerWrapper.this.connectedDocuments.put(fileUri, data);
@@ -686,6 +692,7 @@ public class LanguageServerWrapper implements Disposable {
 
     @NotNull
     private DocumentContentSynchronizer createDocumentContentSynchronizer(@NotNull URI fileUri,
+                                                                          @NotNull VirtualFile file,
                                                                           @NotNull Document document) {
         Either<TextDocumentSyncKind, TextDocumentSyncOptions> syncOptions = initializeFuture == null ? null
                 : this.serverCapabilities.getTextDocumentSync();
@@ -697,7 +704,7 @@ public class LanguageServerWrapper implements Disposable {
                 syncKind = syncOptions.getLeft();
             }
         }
-        return new DocumentContentSynchronizer(this, fileUri, document, syncKind);
+        return new DocumentContentSynchronizer(this, fileUri, file, document, syncKind);
     }
 
     public void disconnect(URI path, boolean stopIfNoOpenedFiles) {
@@ -708,7 +715,13 @@ public class LanguageServerWrapper implements Disposable {
             synchronizer.getDocument().removeDocumentListener(synchronizer);
             synchronizer.documentClosed();
         }
-        if (stopIfNoOpenedFiles && this.connectedDocuments.isEmpty()) {
+        if (stopIfNoOpenedFiles) {
+            maybeShutdown();
+        }
+    }
+
+    private void maybeShutdown() {
+        if (!keepAlive()) {
             if (this.serverDefinition.getLastDocumentDisconnectedTimeout() != 0 && !ApplicationManager.getApplication().isUnitTestMode()) {
                 removeStopTimer(true);
                 startStopTimer();
@@ -716,6 +729,19 @@ public class LanguageServerWrapper implements Disposable {
                 stop();
             }
         }
+    }
+
+    private boolean keepAlive() {
+        return getClientFeatures().keepServerAlive() || !this.connectedDocuments.isEmpty() || this.keepAliveCounter.get() > 0;
+    }
+
+    void incrementKeepAlive() {
+        keepAliveCounter.incrementAndGet();
+    }
+
+    void decrementKeepAlive() {
+        keepAliveCounter.decrementAndGet();
+        maybeShutdown();
     }
 
     /**
@@ -761,6 +787,10 @@ public class LanguageServerWrapper implements Disposable {
         } else {
             return languageServerFuture.join();
         }
+    }
+
+    public LanguageServer getLanguageServer() {
+        return languageServer;
     }
 
     /**
@@ -828,43 +858,6 @@ public class LanguageServerWrapper implements Disposable {
         return serverCapabilities;
     }
 
-    /**
-     * @return The language ID that this wrapper is dealing with if defined in the
-     * language mapping for the language server
-     */
-    @Nullable
-    public String getLanguageId(@Nullable Language language) {
-        while (language != null) {
-            String languageId = serverDefinition.getLanguageId(language);
-            if (languageId != null) {
-                return languageId;
-            }
-            language = language.getBaseLanguage();
-        }
-        return null;
-    }
-
-    /**
-     * @return The language ID that this wrapper is dealing with if defined in the
-     * file type mapping for the language server
-     */
-    @Nullable
-    public String getLanguageId(@Nullable FileType fileType) {
-        if (fileType == null) {
-            return null;
-        }
-        return serverDefinition.getLanguageId(fileType);
-    }
-
-    /**
-     * @return The language ID that this wrapper is dealing with if defined in the
-     * file type mapping for the language server
-     */
-    @Nullable
-    public String getLanguageId(@NotNull String filename) {
-        return serverDefinition.getLanguageId(filename);
-    }
-
     public void registerCapability(RegistrationParams params) {
         initializeFuture.thenRun(() -> {
             params.getRegistrations().forEach(reg -> {
@@ -907,47 +900,30 @@ public class LanguageServerWrapper implements Disposable {
                     } catch (Exception e) {
                         LOGGER.error("Error while getting 'workspace/executeCommand' capability", e);
                     }
-                } else if (LSPRequestConstants.TEXT_DOCUMENT_FORMATTING.equals(reg.getMethod())) {
-                    // register 'textDocument/formatting' capability
-                    final Either<Boolean, DocumentFormattingOptions> documentFormattingProvider = serverCapabilities.getDocumentFormattingProvider();
-                    if (documentFormattingProvider == null || documentFormattingProvider.isLeft()) {
-                        serverCapabilities.setDocumentFormattingProvider(Boolean.TRUE);
-                        addRegistration(reg, () -> serverCapabilities.setDocumentFormattingProvider(documentFormattingProvider));
-                    } else {
-                        serverCapabilities.setDocumentFormattingProvider(documentFormattingProvider.getRight());
-                        addRegistration(reg, () -> serverCapabilities.setDocumentFormattingProvider(documentFormattingProvider));
-                    }
-                } else if (LSPRequestConstants.TEXT_DOCUMENT_RANGE_FORMATTING.equals(reg.getMethod())) {
-                    // register 'textDocument/rangeFormatting' capability
-                    final Either<Boolean, DocumentRangeFormattingOptions> documentRangeFormattingProvider = serverCapabilities.getDocumentRangeFormattingProvider();
-                    if (documentRangeFormattingProvider == null || documentRangeFormattingProvider.isLeft()) {
-                        serverCapabilities.setDocumentRangeFormattingProvider(Boolean.TRUE);
-                        addRegistration(reg, () -> serverCapabilities.setDocumentRangeFormattingProvider(documentRangeFormattingProvider));
-                    } else {
-                        serverCapabilities.setDocumentRangeFormattingProvider(documentRangeFormattingProvider.getRight());
-                        addRegistration(reg, () -> serverCapabilities.setDocumentRangeFormattingProvider(documentRangeFormattingProvider));
-                    }
-                } else if (LSPRequestConstants.TEXT_DOCUMENT_CODE_ACTION.equals(reg.getMethod())) {
+                } else {
+                    String method = reg.getMethod();
                     try {
-                        // Get old 'textDocument/codeAction' capability
-                        final Either<Boolean, CodeActionOptions> beforeRegistration = serverCapabilities.getCodeActionProvider();
-
-                        // Register new 'textDocument/codeAction' capability
-                        CodeActionRegistrationOptions options = JSONUtils.getLsp4jGson()
-                                .fromJson((JsonObject) reg.getRegisterOptions(),
-                                        CodeActionRegistrationOptions.class);
-                        CodeActionOptions codeActionOptions = new CodeActionOptions();
-                        codeActionOptions.setCodeActionKinds(options.getCodeActionKinds());
-                        codeActionOptions.setResolveProvider(options.getResolveProvider());
-                        // TODO: manage CodeActionRegistrationOptions#getDocumentSelector()
-                        serverCapabilities.setCodeActionProvider(Either.forRight(codeActionOptions));
-
-                        // Add registration handler to:
-                        // - unregister the new 'textDocument/codeAction' capability
-                        // - register the old 'textDocument/codeAction' capability
-                        addRegistration(reg, () -> serverCapabilities.setCodeActionProvider(beforeRegistration));
+                        final TextDocumentServerCapabilityRegistry<? extends TextDocumentRegistrationOptions> registry = getClientFeatures().getCapabilityRegistry(method);
+                        if (registry != null) {
+                            // register 'textDocument/*' capability
+                            JsonObject registerOptions = (JsonObject) reg.getRegisterOptions();
+                            if (registerOptions == null) {
+                                // ex:
+                                // {
+                                //  "registrations": [
+                                //    {
+                                //      "id": "5d54639d-a478-422f-bfb8-112c4b8a93ee",
+                                //      "method": "textDocument/hover"
+                                //    }
+                                //  ]
+                                //}
+                                registerOptions = new JsonObject();
+                            }
+                            final TextDocumentRegistrationOptions options = registry.registerCapability(registerOptions);
+                            addRegistration(reg, () -> registry.unregisterCapability(options));
+                        }
                     } catch (Exception e) {
-                        LOGGER.error("Error while getting 'textDocument/codeAction' capability", e);
+                        LOGGER.error("Error while getting '" + method + "' capability", e);
                     }
                 }
             });
@@ -1000,13 +976,13 @@ public class LanguageServerWrapper implements Disposable {
     public void unregisterCapability(UnregistrationParams params) {
         params.getUnregisterations().forEach(reg -> {
             String id = reg.getId();
-            Runnable unregistrator;
+            Runnable unregisters;
             synchronized (dynamicRegistrations) {
-                unregistrator = dynamicRegistrations.get(id);
+                unregisters = dynamicRegistrations.get(id);
                 dynamicRegistrations.remove(id);
             }
-            if (unregistrator != null) {
-                unregistrator.run();
+            if (unregisters != null) {
+                unregisters.run();
             }
         });
     }
@@ -1133,45 +1109,27 @@ public class LanguageServerWrapper implements Disposable {
      * @param file the file.
      * @return true if the given file support the 'workspace/didRenameFiles' and false otherwise.
      */
-    public boolean isDidRenameFilesSupported(PsiFile file) {
+    public boolean isDidRenameFilesSupported(@NotNull PsiFile file) {
         if (fileOperationsManager == null) {
             return false;
         }
         return fileOperationsManager.canDidRenameFiles(LSPIJUtils.toUri(file), file.isDirectory());
     }
 
-    /**
-     * Returns true if the given character is defined as "completion trigger" in the server capability of the language server and false otherwise.
-     *
-     * @param charTyped the current typed character.
-     * @return true if the given character is defined as "completion trigger" in the server capability of the language server and false otherwise.
-     */
-    public boolean isCompletionTriggerCharactersSupported(String charTyped) {
-        if (serverCapabilities == null) {
-            return false;
+    public LSPClientFeatures getClientFeatures() {
+        if (clientFeatures == null) {
+            clientFeatures = getOrCreateClientFeatures();
         }
-        var triggerCharacters = serverCapabilities.getCompletionProvider() != null ? serverCapabilities.getCompletionProvider().getTriggerCharacters() : null;
-        if (triggerCharacters == null || triggerCharacters.isEmpty()) {
-            return false;
-        }
-        return triggerCharacters.contains(charTyped);
+        return clientFeatures;
     }
 
-    /**
-     * Returns true if the given character is defined as "signature trigger" in the server capability of the language server and false otherwise.
-     *
-     * @param charTyped the current typed character.
-     * @return true if the given character is defined as "signature trigger" in the server capability of the language server and false otherwise.
-     */
-    public boolean isSignatureTriggerCharactersSupported(String charTyped) {
-        if (serverCapabilities == null) {
-            return false;
+    private synchronized LSPClientFeatures getOrCreateClientFeatures() {
+        if (clientFeatures != null) {
+            return clientFeatures;
         }
-
-        var triggerCharacters = serverCapabilities.getSignatureHelpProvider() != null ? serverCapabilities.getSignatureHelpProvider().getTriggerCharacters() : null;
-        if (triggerCharacters == null || triggerCharacters.isEmpty()) {
-            return false;
-        }
-        return triggerCharacters.contains(charTyped);
+        LSPClientFeatures clientFeatures = getServerDefinition().createClientFeatures();
+        clientFeatures.setServerWrapper(this);
+        return clientFeatures;
     }
+
 }

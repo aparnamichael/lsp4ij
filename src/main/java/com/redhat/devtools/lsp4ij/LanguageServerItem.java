@@ -10,14 +10,25 @@
  ******************************************************************************/
 package com.redhat.devtools.lsp4ij;
 
+import com.intellij.openapi.project.Project;
 import com.intellij.psi.PsiFile;
+import com.redhat.devtools.lsp4ij.client.features.LSPClientFeatures;
 import com.redhat.devtools.lsp4ij.features.semanticTokens.SemanticTokensColorsProvider;
+import com.redhat.devtools.lsp4ij.server.LanguageServerException;
+import com.redhat.devtools.lsp4ij.server.Lease;
+import com.redhat.devtools.lsp4ij.server.ServerWasStoppedException;
+import com.redhat.devtools.lsp4ij.server.definition.LanguageServerDefinition;
 import org.eclipse.lsp4j.*;
 import org.eclipse.lsp4j.jsonrpc.messages.Either;
 import org.eclipse.lsp4j.services.LanguageServer;
 import org.eclipse.lsp4j.services.TextDocumentService;
 import org.eclipse.lsp4j.services.WorkspaceService;
+import org.jetbrains.annotations.ApiStatus;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Item which stores the initialized LSP4j language server and the language server wrapper.
@@ -35,12 +46,81 @@ public class LanguageServerItem {
     }
 
     /**
-     * Returns the LSP4j language server.
+     * Creates a 'lease' on this language server which expresses the intent of
+     * the caller for the server to be 'kept alive' for as long as this
+     * lease has not been disposed.
+     * <p>
+     * The server may still be terminated under some exceptional circumstances, for example
+     * when:
+     * - the server crashed
+     * - the user explicitly terminated the server from the lsp4ij user interface
+     * - the IDE is shutting down
+     * <p>
+     * Under 'normal circumstances' however the server will not be shutdown due to 'inactivity'
+     * or because there are no more open editors.
+     * <p>
+     * In other words calling this methods creates a 'similar demand' on the language
+     * server's lifecycle as would opening a document in an editor.
+     */
+    public Lease<LanguageServerItem> keepAlive() {
+        serverWrapper.incrementKeepAlive();
+        return new Lease<>() {
+            final AtomicBoolean isDisposed = new AtomicBoolean();
+
+            @Override
+            public LanguageServerItem get() throws ServerWasStoppedException, IllegalStateException {
+                if (isDisposed.get()) {
+                    throw new IllegalStateException("Bug: trying to use an already disposed Lease");
+                }
+                var item = LanguageServerItem.this;
+                if (item.serverWrapper.getServerStatus() == ServerStatus.started) {
+                    return LanguageServerItem.this;
+                }
+                //TODO (maybe): Can `item.serverWrapper.getServerError()` provide a more informative error message?
+                var serverDefinition = item.getServerDefinition();
+                throw new ServerWasStoppedException("The server was stopped unexpectedly '"
+                        + serverDefinition.getId() + "' (pid=" + item.serverWrapper.getCurrentProcessId()+")");
+            }
+            @Override
+            public void dispose() {
+                 if (!isDisposed.getAndSet(true)) {
+                     serverWrapper.decrementKeepAlive();
+                 }
+            }
+        };
+    }
+
+    /**
+     * Returns the project.
      *
-     * @return the LSP4j language server.
+     * @return the project.
+     */
+    @NotNull
+    public Project getProject() {
+        return getServerWrapper().getProject();
+    }
+
+    /**
+     * Returns the LSP4J language server initialized when the LanguageServerItem was created.
+     * <p>
+     * Storing this instance is not recommended, as there's no guarantee the language server instance will still be alive in the long term.
+     * Thus, it is recommended to use {@link #getInitializedServer()} instead, which guarantees the server instance will be initialized at the time of that call.
+     * </p>
+     *
+     * @return the LSP4J language server initialized when the LanguageServerItem was created.
      */
     public LanguageServer getServer() {
         return server;
+    }
+
+    /**
+     * Returns the LSP4J language server, guaranteed to be initialized at that point.
+     *
+     * @return the LSP4J language server, guaranteed to be initialized at that point.
+     */
+    @NotNull
+    public CompletableFuture<LanguageServer> getInitializedServer() {
+        return getServerWrapper().getInitializedServer();
     }
 
     /**
@@ -48,8 +128,28 @@ public class LanguageServerItem {
      *
      * @return the language server wrapper.
      */
+    @ApiStatus.Internal
     public LanguageServerWrapper getServerWrapper() {
         return serverWrapper;
+    }
+
+    /**
+     * Returns the server definition.
+     *
+     * @return the server definition.
+     */
+    @NotNull
+    public LanguageServerDefinition getServerDefinition() {
+        return getServerWrapper().getServerDefinition();
+    }
+
+    /**
+     * Returns the LSP client features.
+     *
+     * @return the LSP client features.
+     */
+    public LSPClientFeatures getClientFeatures() {
+        return getServerWrapper().getClientFeatures();
     }
 
     /**
@@ -62,303 +162,12 @@ public class LanguageServerItem {
     }
 
     /**
-     * Returns true if the language server can support resolve completion and false otherwise.
-     *
-     * @return true if the language server can support resolve completion and false otherwise.
-     */
-    public boolean isResolveCompletionSupported() {
-        return isResolveCompletionSupported(getServerCapabilities());
-    }
-
-    /**
-     * Returns true if the language server can support signature help and false otherwise.
-     *
-     * @return true if the language server can support signature help and false otherwise.
-     */
-    public boolean isSignatureHelpSupported() {
-        return isSignatureHelpSupported(getServerCapabilities());
-    }
-
-    /**
-     * Returns true if the language server can support resolve code lens and false otherwise.
-     *
-     * @return true if the language server can support resolve code lens and false otherwise.
-     */
-    public boolean isResolveCodeLensSupported() {
-        return isResolveCodeLensSupported(getServerCapabilities());
-    }
-
-    /**
-     * Returns true if the language server can support resolve inlay hint and false otherwise.
-     *
-     * @return true if the language server can support resolve inlay hint and false otherwise.
-     */
-    public boolean isResolveInlayHintSupported() {
-        return isResolveInlayHintSupported(getServerCapabilities());
-    }
-
-    /**
-     * Returns true if the language server can support references and false otherwise.
-     *
-     * @return true if the language server can support references and false otherwise.
-     */
-    public boolean isReferencesSupported() {
-        return isReferencesSupported(getServerCapabilities());
-    }
-
-    /**
-     * Returns true if the language server can support implementation and false otherwise.
-     *
-     * @return true if the language server can support implementation and false otherwise.
-     */
-    public boolean isImplementationSupported() {
-        return isImplementationSupported(getServerCapabilities());
-    }
-
-    /**
-     * Returns true if the language server can support declaration and false otherwise.
-     *
-     * @return true if the language server can support declaration and false otherwise.
-     */
-    public boolean isDeclarationSupported() {
-        return isDeclarationSupported(getServerCapabilities());
-    }
-
-    /**
-     * Returns true if the language server can support definition and false otherwise.
-     *
-     * @return true if the language server can support definition and false otherwise.
-     */
-    public boolean isDefinitionSupported() {
-        return isDefinitionSupported(getServerCapabilities());
-    }
-
-    /**
-     * Returns true if the language server can support type definition and false otherwise.
-     *
-     * @return true if the language server can support type definition and false otherwise.
-     */
-    public boolean isTypeDefinitionSupported() {
-        return isTypeDefinitionSupported(getServerCapabilities());
-    }
-
-    /**
-     * Returns true if the language server can support formatting and false otherwise.
-     *
-     * @return true if the language server can support formatting and false otherwise.
-     */
-    public boolean isDocumentFormattingSupported() {
-        return isDocumentFormattingSupported(getServerCapabilities());
-    }
-
-    /**
      * Returns true if the language server can support range formatting and false otherwise.
      *
      * @return true if the language server can support range formatting and false otherwise.
      */
     public boolean isDocumentRangeFormattingSupported() {
         return isDocumentRangeFormattingSupported(getServerCapabilities());
-    }
-
-    /**
-     * Returns true if the language server can support completion and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support completion and false otherwise.
-     */
-    public static boolean isCompletionSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                serverCapabilities.getCompletionProvider() != null;
-    }
-
-    /**
-     * Returns true if the language server can support resolve completion and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support resolve completion and false otherwise.
-     */
-    public static boolean isResolveCompletionSupported(@Nullable ServerCapabilities serverCapabilities) {
-        var completionProvider = serverCapabilities != null ? serverCapabilities.getCompletionProvider() : null;
-        return completionProvider != null && hasCapability(completionProvider.getResolveProvider());
-    }
-
-    /**
-     * Returns true if the language server can support signature help and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support signature help and false otherwise.
-     */
-    public static boolean isSignatureHelpSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                serverCapabilities.getSignatureHelpProvider() != null;
-    }
-
-    /**
-     * Returns true if the language server can support code lens and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support code lens and false otherwise.
-     */
-    public static boolean isCodeLensSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                serverCapabilities.getCodeLensProvider() != null;
-    }
-
-    /**
-     * Returns true if the language server can support resolve code lens and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support resolve code lens and false otherwise.
-     */
-    public static boolean isResolveCodeLensSupported(@Nullable ServerCapabilities serverCapabilities) {
-        var codeLensProvider = serverCapabilities != null ? serverCapabilities.getCodeLensProvider() : null;
-        return codeLensProvider != null && hasCapability(codeLensProvider.getResolveProvider());
-    }
-
-    /**
-     * Returns true if the language server can support inlay hint and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support inlay hint and false otherwise.
-     */
-    public static boolean isInlayHintSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getInlayHintProvider());
-    }
-
-    /**
-     * Returns true if the language server can support resolve inlay hint and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support resolve inlay hint and false otherwise.
-     */
-    public static boolean isResolveInlayHintSupported(@Nullable ServerCapabilities serverCapabilities) {
-        var inlayHintProvider = serverCapabilities != null ? serverCapabilities.getInlayHintProvider() : null;
-        if (inlayHintProvider != null && inlayHintProvider.isRight()) {
-            return hasCapability(inlayHintProvider.getRight().getResolveProvider());
-        }
-        return false;
-    }
-
-    /**
-     * Returns true if the language server can support color and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support color and false otherwise.
-     */
-    public static boolean isColorSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getColorProvider());
-    }
-
-    /**
-     * Returns true if the language server can support declaration and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support declaration and false otherwise.
-     */
-    public static boolean isDeclarationSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getDeclarationProvider());
-    }
-
-    /**
-     * Returns true if the language server can support definition and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support definition and false otherwise.
-     */
-    public static boolean isDefinitionSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getDefinitionProvider());
-    }
-
-    /**
-     * Returns true if the language server can support type definition and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support type definition and false otherwise.
-     */
-    public static boolean isTypeDefinitionSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getTypeDefinitionProvider());
-    }
-
-    /**
-     * Returns true if the language server can support document highlight and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support document highlight and false otherwise.
-     */
-    public static boolean isDocumentHighlightSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getDocumentHighlightProvider());
-    }
-
-    /**
-     * Returns true if the language server can support document link and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support document link and false otherwise.
-     */
-    public static boolean isDocumentLinkSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                serverCapabilities.getDocumentLinkProvider() != null;
-    }
-
-    /**
-     * Returns true if the language server can support document link and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support document link and false otherwise.
-     */
-    public static boolean isHoverSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getHoverProvider());
-    }
-
-    /**
-     * Returns true if the language server can support references and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support references and false otherwise.
-     */
-    public static boolean isReferencesSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getReferencesProvider());
-    }
-
-    /**
-     * Returns true if the language server can support references and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support references and false otherwise.
-     */
-    public static boolean isImplementationSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getImplementationProvider());
-    }
-
-    /**
-     * Returns true if the language server can support folding and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support folding and false otherwise.
-     */
-    public static boolean isFoldingSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getFoldingRangeProvider());
-    }
-
-    /**
-     * Returns true if the language server can support formatting and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support formatting and false otherwise.
-     */
-    public static boolean isDocumentFormattingSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getDocumentFormattingProvider());
     }
 
     /**
@@ -370,62 +179,6 @@ public class LanguageServerItem {
     public static boolean isDocumentRangeFormattingSupported(@Nullable ServerCapabilities serverCapabilities) {
         return serverCapabilities != null &&
                 hasCapability(serverCapabilities.getDocumentRangeFormattingProvider());
-    }
-
-    /**
-     * Returns true if the language server can support code action and false otherwise.
-     *
-     * @return true if the language server can support code action and false otherwise.
-     */
-    public boolean isCodeActionSupported() {
-        return isCodeActionSupported(getServerCapabilities());
-    }
-
-    /**
-     * Returns true if the language server can support code action and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support code action and false otherwise.
-     */
-    public static boolean isCodeActionSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getCodeActionProvider());
-    }
-
-    /**
-     * Returns true if the language server can support resolve code action and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support resolve code action and false otherwise.
-     */
-    public static boolean isCodeActionResolveSupported(@Nullable ServerCapabilities serverCapabilities) {
-        Either<Boolean, CodeActionOptions> codeActionProvider = serverCapabilities != null ? serverCapabilities.getCodeActionProvider() : null;
-        if (codeActionProvider != null && codeActionProvider.isRight()) {
-            return hasCapability(codeActionProvider.getRight().getResolveProvider());
-        }
-        return false;
-    }
-
-    /**
-     * Returns true if the language server can support semantic tokens and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support semantic tokens and false otherwise.
-     */
-    public static boolean isSemanticTokensSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                serverCapabilities.getSemanticTokensProvider() != null;
-    }
-
-    /**
-     * Returns true if the language server can support rename and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support rename and false otherwise.
-     */
-    public static boolean isRenameSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getRenameProvider());
     }
 
     /**
@@ -479,7 +232,7 @@ public class LanguageServerItem {
         ExecuteCommandOptions provider = serverCapabilities.getExecuteCommandProvider();
         return provider != null && provider.getCommands().contains(command.getCommand());
     }
-    
+
     /**
      * Returns the LSP {@link TextDocumentService} of the language server.
      *
@@ -510,36 +263,7 @@ public class LanguageServerItem {
     }
 
     public SemanticTokensColorsProvider getSemanticTokensColorsProvider() {
-        return getServerWrapper().getServerDefinition().getSemanticTokensColorsProvider();
+        return getClientFeatures().getSemanticTokensFeature();
     }
 
-    /**
-     * Returns true if the language server can support document symbol and false otherwise.
-     *
-     * @return true if the language server can support document symbol and false otherwise.
-     */
-    public static boolean isDocumentSymbolSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getDocumentSymbolProvider());
-    }
-
-    /**
-     * Returns true if the language server can support workspace symbol and false otherwise.
-     *
-     * @return true if the language server can support workspace symbol and false otherwise.
-     */
-    public boolean isWorkspaceSymbolSupported() {
-        return isWorkspaceSymbolSupported(getServerCapabilities());
-    }
-
-    /**
-     * Returns true if the language server can support workspace symbol and false otherwise.
-     *
-     * @param serverCapabilities the server capabilities.
-     * @return true if the language server can support workspace symbol and false otherwise.
-     */
-    public static boolean isWorkspaceSymbolSupported(@Nullable ServerCapabilities serverCapabilities) {
-        return serverCapabilities != null &&
-                hasCapability(serverCapabilities.getWorkspaceSymbolProvider());
-    }
 }
